@@ -131,9 +131,7 @@ class Trainer:
         self.val_accuracy = torchmetrics.Accuracy(
             task="multiclass", num_classes=self.data_config.num_classes
         ).to(self.device)
-        self.metrics_computer = MetricsComputer(self.data_config.num_classes).to(
-            self.device
-        )
+        self.metrics_computer = MetricsComputer(self.data_config.num_classes).to(self.device)
 
     def __del__(self):
         self.pbar.close()
@@ -186,9 +184,7 @@ class Trainer:
         epoch_config = self.config.epoch_config
         if self._should_prune():
             tqdm.write(f"Pruning method: {self.pruner}")
-            self._run_training(
-                epoch_config.num_pre_prune_epochs, "Training before Pruning"
-            )
+            self._run_training(epoch_config.num_pre_prune_epochs, "Training before Pruning")
             self._run_prune()
         self._run_training(
             epoch_config.num_train_epochs,
@@ -253,13 +249,14 @@ class Trainer:
                 dynamic_ncols=True,
             )
             batch_counter = 0
+            config.train_optimizer.zero_grad(set_to_none=True)
             for inputs, labels in pbar:
-                config.train_optimizer.zero_grad(set_to_none=True)
                 outputs = config.model(inputs)
                 loss = config.loss_fn(outputs, labels)
+                loss_avg.update(loss)
                 self.fabric.backward(loss)
                 config.train_optimizer.step()
-                loss_avg.update(loss)
+                config.train_optimizer.zero_grad(set_to_none=True)
                 if lr_scheduler is not None:
                     lr_scheduler.step_after_batch()
                 if (batch_counter + 1) % tqdm_update_frequency == 0:
@@ -288,6 +285,66 @@ class Trainer:
                 + f"Best Accuracy/Test: {best_accuracy:.4f}"
             )
 
+    def _run_prune_iteration(self, iteration):
+        config = self.config
+        epoch_config = self.epoch_config
+        num_batches_in_epoch = epoch_config.num_batches_in_epoch
+        tqdm_update_frequency = epoch_config.tqdm_update_frequency
+        self.pruner.start_iteration()
+        for epoch in range(epoch_config.num_prune_epochs):
+            self.global_step += 1
+            self.pbar.update(1)
+            config.model.train()
+            loss_avg = AverageMeter(self.fabric)
+            pbar = tqdm(
+                self.pruning_trainloader,
+                leave=False,
+                desc=f"Prune epoch: {epoch}",
+                dynamic_ncols=True,
+            )
+            batch_counter = 0
+            config.prune_optimizer.zero_grad(set_to_none=True)
+            for inputs, labels in pbar:
+                outputs = config.model(inputs)
+                # Compute loss
+                loss = config.loss_fn(outputs, labels)
+                loss_avg.update(loss)
+                self.pruner.provide_loss_before_step(loss)
+                # Take a gradient step
+                self.fabric.backward(loss)
+                config.prune_optimizer.step()
+                config.prune_optimizer.zero_grad(set_to_none=True)
+                # Compute loss again
+                with torch.no_grad():
+                    outputs = config.model(inputs)
+                    loss = config.loss_fn(outputs, labels)
+                    self.pruner.provide_loss_after_step(loss)
+                if (batch_counter + 1) % tqdm_update_frequency == 0:
+                    pbar.update(tqdm_update_frequency)
+                if num_batches_in_epoch > 0 and batch_counter >= num_batches_in_epoch:
+                    break
+                batch_counter += 1
+            pbar.close()
+            loss = loss_avg.mean()
+            self.add_scalar("Loss/train", loss, self.global_step)
+            accuracy = self.eval_model()
+            iter_str = f"{iteration + 1}/{epoch_config.num_prune_iterations}"
+            epoch_str = f"{epoch + 1}/{epoch_config.num_prune_epochs}"
+            self.pbar.set_description(
+                f"Prune: Iteration {iter_str}; "
+                + f"Epoch: {epoch_str}; "
+                + f"Loss/Train: {loss:.4f}; "
+                + f"Accuracy/Test: {accuracy:.4f}"
+            )
+        # Shutdown pruning_trainloader's worker until next iteration to save resources.
+        del self.pruning_trainloader._iterator
+        self.pruning_trainloader._iterator = None
+        self.pruner.compute_masks(get_optimizer_lr(config.prune_optimizer))
+        self.compute_prune_stats()
+        self.fabric.barrier()
+        self.pruner.reset_weights()
+        self.pruner.reset_params()
+
     @torch.no_grad()
     def eval_model(self) -> float:
         accuracy = np.nan
@@ -295,9 +352,7 @@ class Trainer:
             model = self.config.model
             model.eval()
             self.val_accuracy.reset()
-            for data in tqdm(
-                self.testloader, leave=False, desc="Eval", dynamic_ncols=True
-            ):
+            for data in tqdm(self.testloader, leave=False, desc="Eval", dynamic_ncols=True):
                 inputs, labels = data
                 outputs = model(inputs)
                 self.val_accuracy(outputs, labels)
@@ -314,9 +369,7 @@ class Trainer:
         model.eval()
         self.val_accuracy.reset()
         self.metrics_computer.reset()
-        for data in tqdm(
-            self.testloader, leave=False, desc="Eval Stats", dynamic_ncols=True
-        ):
+        for data in tqdm(self.testloader, leave=False, desc="Eval Stats", dynamic_ncols=True):
             inputs, labels = data
             outputs = model(inputs)
             self.metrics_computer.add(outputs, labels)

@@ -13,7 +13,7 @@ class AverageMeter:
         self.count = torch.tensor([0], device=self.device)
 
     def update(self, val: torch.Tensor):
-        self.sum += val
+        self.sum += val.detach()
         self.count += 1
 
     def mean(self) -> float:

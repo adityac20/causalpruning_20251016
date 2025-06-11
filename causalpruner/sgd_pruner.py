@@ -80,9 +80,7 @@ class ParamDataset(Dataset):
         return delta_weights, delta_loss
 
     @torch.no_grad()
-    def get_delta_param(
-        self, dir: str, idx: int, zstats: Optional[ZStats] = None
-    ) -> torch.Tensor:
+    def get_delta_param(self, dir: str, idx: int, zstats: Optional[ZStats] = None) -> torch.Tensor:
         file_path = os.path.join(dir, f"ckpt.{idx}")
         val = torch.load(file_path)
         val = torch.nan_to_num(val, nan=0, posinf=0, neginf=0)
@@ -158,9 +156,9 @@ class ZStatsComputer:
     @torch.no_grad()
     def global_std(self) -> torch.Tensor:
         if self.global_std_ is None:
-            variance = (
-                self.global_sum_x_squared / self.global_num_items
-            ) - torch.square(self.global_mean)
+            variance = (self.global_sum_x_squared / self.global_num_items) - torch.square(
+                self.global_mean
+            )
             std_dev = torch.sqrt(variance)
             self.global_std_ = std_dev
         return self.global_std_
@@ -169,9 +167,7 @@ class ZStatsComputer:
 class DeltaComputer:
     def __init__(
         self,
-        transform: Optional[
-            Callable[[torch.Tensor], torch.Tensor]
-        ] = torch.nn.Identity(),
+        transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = torch.nn.Identity(),
     ):
         self.first_tensor = None
         self.second_tensor = None
@@ -234,15 +230,11 @@ class SGDPruner(Pruner):
         self.num_params = 0
         self.params_to_dims = dict()
         for param in self.params:
-            self.params_to_dims[param] = np.prod(
-                self.modules_dict[param].weight.size(), dtype=int
-            )
+            self.params_to_dims[param] = np.prod(self.modules_dict[param].weight.size(), dtype=int)
             self.num_params += self.params_to_dims[param]
         self.trainer_config = config.trainer_config
 
-        self.prune_optimizer = optim.SGD(
-            config.model.parameters(), lr=config.prune_optimizer_lr
-        )
+        self.prune_optimizer = optim.SGD(config.model.parameters(), lr=config.prune_optimizer_lr)
         self.prune_optimizer_lr = config.prune_optimizer_lr
         self.prune_optimizer = self.fabric.setup_optimizers(self.prune_optimizer)
 
@@ -312,9 +304,7 @@ class SGDPruner(Pruner):
             os.makedirs(loss_dir, exist_ok=True)
             weights_dir = os.path.join(self.weights_checkpoint_dir, iteration_name)
             os.makedirs(weights_dir, exist_ok=True)
-            self.weights_dir = os.path.join(
-                self.weights_checkpoint_dir, f"{self.iteration}"
-            )
+            self.weights_dir = os.path.join(self.weights_checkpoint_dir, f"{self.iteration}")
             self.delta_weights_computer = DeltaComputer(transform=torch.square)
             self.loss_dir = os.path.join(self.loss_checkpoint_dir, f"{self.iteration}")
             self.delta_loss_computer = DeltaComputer()
@@ -346,7 +336,7 @@ class SGDPruner(Pruner):
     def provide_loss_before_step(self, loss: torch.tensor) -> None:
         if self.fabric.is_global_zero:
             torch.cuda.synchronize()
-            self.delta_loss_computer.add_first(loss)
+            self.delta_loss_computer.add_first(loss.detach())
             self.delta_weights_computer.add_first(self.get_flattened_weight())
             torch.cuda.synchronize()
         self.fabric.barrier()
@@ -355,7 +345,7 @@ class SGDPruner(Pruner):
     def provide_loss_after_step(self, loss: torch.tensor) -> None:
         if self.fabric.is_global_zero:
             torch.cuda.synchronize()
-            self.delta_loss_computer.add_second(loss)
+            self.delta_loss_computer.add_second(loss.detach())
             self.delta_weights_computer.add_second(self.get_flattened_weight())
 
             delta_loss = self.delta_loss_computer.get_delta().to("cpu")
@@ -364,9 +354,7 @@ class SGDPruner(Pruner):
 
             delta_weights = self.delta_weights_computer.get_delta().to("cpu")
             if delta_weights is not None:
-                self.write_tensor(
-                    delta_weights, self._get_checkpoint_path(self.weights_dir)
-                )
+                self.write_tensor(delta_weights, self._get_checkpoint_path(self.weights_dir))
             torch.cuda.synchronize()
         self.fabric.barrier()
         self.counter += 1
@@ -462,9 +450,7 @@ class SGDPruner(Pruner):
         for param in self.params:
             end_index += self.params_to_dims[param]
             weight = self.modules_dict[param].weight
-            masks[param] = (
-                mask[start_index:end_index].to(weight.device).reshape_as(weight)
-            )
+            masks[param] = mask[start_index:end_index].to(weight.device).reshape_as(weight)
             start_index = end_index
         return masks
 
@@ -472,16 +458,10 @@ class SGDPruner(Pruner):
         return os.path.join(checkpoint_dir, f"ckpt.{self.counter}")
 
     def _write_zscaling_params(self):
-        self._write_zscaling_params_from_computer(
-            self.delta_loss_computer, self.loss_dir
-        )
-        self._write_zscaling_params_from_computer(
-            self.delta_weights_computer, self.weights_dir
-        )
+        self._write_zscaling_params_from_computer(self.delta_loss_computer, self.loss_dir)
+        self._write_zscaling_params_from_computer(self.delta_weights_computer, self.weights_dir)
 
-    def _write_zscaling_params_from_computer(
-        self, computer: DeltaComputer, dir_path: str
-    ):
+    def _write_zscaling_params_from_computer(self, computer: DeltaComputer, dir_path: str):
         dir_path = os.path.join(dir_path, _ZSTATS_PATTERN)
         zstats_computer = computer.zstats_computer.to("cpu")
         torch.save(
