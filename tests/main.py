@@ -111,9 +111,7 @@ def main(args):
     if args.start_clean:
         delete_dir_if_exists(checkpoint_dir)
         delete_dir_if_exists(tensorboard_dir)
-    fabric = Fabric(
-        devices=args.device_ids, accelerator="auto", precision=args.precision
-    )
+    fabric = Fabric(devices=args.device_ids, accelerator="auto", precision=args.precision)
     fabric.launch()
     model = get_model(model_name, dataset_name, args.trained_checkpoint_dir)
     if args.compile_model:
@@ -125,9 +123,7 @@ def main(args):
         model_name,
         args.dataset_root_dir,
     )
-    collate_fn = get_collate_fn(
-        args.mixup_alpha, args.cutmix_alpha, num_classes=num_classes
-    )
+    collate_fn = get_collate_fn(args.mixup_alpha, args.cutmix_alpha, num_classes=num_classes)
     world_size = fabric.world_size
     batch_size = args.batch_size // world_size
     batch_size_while_pruning = args.batch_size_while_pruning // world_size
@@ -145,9 +141,7 @@ def main(args):
     epoch_config = EpochConfig(
         num_pre_prune_epochs=args.num_pre_prune_epochs if args.prune else 0,
         num_prune_iterations=args.num_prune_iterations if args.prune else 0,
-        num_train_epochs_before_pruning=args.num_train_epochs_before_pruning
-        if args.prune
-        else 0,
+        num_train_epochs_before_pruning=args.num_train_epochs_before_pruning if args.prune else 0,
         num_prune_epochs=args.num_prune_epochs if args.prune else 0,
         num_train_epochs=args.num_train_epochs,
         num_batches_in_epoch=args.num_batches_in_epoch,
@@ -221,9 +215,7 @@ def main(args):
             )
         elif args.pruner == "magpruner":
             num_prune_iterations = args.num_prune_iterations
-            prune_amount_per_iteration = 1 - (1 - total_prune_amount) ** (
-                1 / num_prune_iterations
-            )
+            prune_amount_per_iteration = 1 - (1 - total_prune_amount) ** (1 / num_prune_iterations)
             pruner_config = MagPrunerConfig(
                 fabric=fabric,
                 model=model,
@@ -459,9 +451,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tqdm_update_frequency", type=int, default=1, help="tqdm update frequency."
     )
-    parser.add_argument(
-        "--optimizer", type=str, default="sgd", help="Optimizer", choices=["sgd"]
-    )
+    parser.add_argument("--optimizer", type=str, default="sgd", help="Optimizer", choices=["sgd"])
     parser.add_argument(
         "--causal_pruner_train_lr",
         type=float,

@@ -1,0 +1,4 @@
+model_name,dataset_name,acc,sparsity
+lenet,mnist,0.9883,0.9930034843205575
+vgglike,cifar10,0.8473,0.9797237369336118
+vgglike,tinyimagenet,0.4128,0.97972209873407

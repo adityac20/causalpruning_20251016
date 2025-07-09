@@ -279,6 +279,7 @@ class SGDPruner(Pruner):
                 if num_batches_in_epoch > 0 and batch_counter >= num_batches_in_epoch:
                     break
                 batch_counter += 1
+
             epoch_pbar.close()
             loss = loss_avg.mean()
             iter_str = f"{self.iteration}/{config.num_prune_iterations}"

@@ -5,7 +5,10 @@ from typing import Literal
 
 from lightning.fabric import Fabric
 import numpy as np
+
 from sklearn.linear_model import SGDRegressor
+from sklearn.metrics import r2_score
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,15 +107,20 @@ class CausalWeightsTrainerTorch(CausalWeightsTrainer):
         self.verbose = verbose
         self.layer = nn.Linear(self.num_params, 1, bias=False)
         nn.init.zeros_(self.layer.weight)
+        # nn.init.xavier_normal_(self.layer.weight)
         if initial_mask.device != self.layer.weight.device:
             initial_mask = initial_mask.to(self.layer.weight.device)
         mask = initial_mask.view_as(self.layer.weight)
         prune.custom_from_mask(self.layer, "weight", mask)
         alpha = self.l1_regularization_coeff / num_params
-        self.optimizer = LassoSGD(
-            self.layer.parameters(),
-            lr=self.init_lr,
-            alpha=alpha,
+        # self.optimizer = LassoSGD(
+        #     self.layer.parameters(),
+        #     lr=0.1,
+        #     alpha=alpha,
+        # )
+        # self.optimizer = torch.optim.AdamW(self.layer.parameters(), lr=1e-3, weight_decay=0.01)
+        self.optimizer = torch.optim.SGD(
+            self.layer.parameters(), lr=0.1, momentum=0.9, weight_decay=0.01
         )
         self.layer, self.optimizer = self.fabric.setup(self.layer, self.optimizer)
         self.prune_amount_this_iteration = self._compute_current_prune_amount(
@@ -125,22 +133,21 @@ class CausalWeightsTrainerTorch(CausalWeightsTrainer):
         num_prune_iterations: int,
         total_prune_amount: float,
     ) -> float:
-        target_prune_amount_this_iteration = self._compute_target_prune_amount(
-            prune_iteration, num_prune_iterations, total_prune_amount
-        )
-        N = 1.0 - target_prune_amount_this_iteration
-        target_prune_amount_last_iteration = self._compute_target_prune_amount(
-            prune_iteration - 1, num_prune_iterations, total_prune_amount
-        )
-        M = 1.0 - target_prune_amount_last_iteration
-        return (M - N) / M
+        # target_prune_amount_this_iteration = self._compute_target_prune_amount(
+        #     prune_iteration, num_prune_iterations, total_prune_amount
+        # )
+        # N = 1.0 - target_prune_amount_this_iteration
+        # target_prune_amount_last_iteration = self._compute_target_prune_amount(
+        #     prune_iteration - 1, num_prune_iterations, total_prune_amount
+        # )
+        # M = 1.0 - target_prune_amount_last_iteration
+        # return (M - N) / M
+        return 1 - (1 - total_prune_amount) ** (1 / num_prune_iterations)
 
     def _compute_target_prune_amount(
         self, prune_iteration: int, num_prune_iterations: int, total_prune_amount: float
     ) -> float:
-        return total_prune_amount * (
-            1 - (1 - prune_iteration / num_prune_iterations) ** 3
-        )
+        return total_prune_amount * (1 - (1 - prune_iteration / num_prune_iterations) ** 3)
 
     def supports_batch_training(self) -> bool:
         return True
@@ -178,10 +185,23 @@ class CausalWeightsTrainerTorch(CausalWeightsTrainer):
                 self.optimizer.step()
                 loss_avg.update(loss)
             loss = loss_avg.mean()
+
+            with torch.no_grad():
+                ytrue = []
+                ypred = []
+                for X, Y in tqdm(dataloader, leave=False, dynamic_ncols=True):
+                    outputs = self.layer(X)
+                    Y = Y.view(outputs.size())
+                    ytrue.append(Y.detach().cpu().numpy())
+                    ypred.append(outputs.detach().cpu().numpy())
+                ytrue = np.concatenate(ytrue)
+                ypred = np.concatenate(ypred)
+                r2 = r2_score(ytrue, ypred)
+
             if self.verbose:
                 tqdm.write(
                     f"Pruning iter: {iter + 1}; "
-                    + f"loss: {loss}; best_loss: {best_loss}"
+                    + f"loss: {loss}; best_loss: {best_loss}; r2: {r2}"
                 )
             if loss > (best_loss - self.loss_tol):
                 iter_no_change += 1
@@ -193,6 +213,8 @@ class CausalWeightsTrainerTorch(CausalWeightsTrainer):
             if iter_no_change >= self.num_iter_no_change:
                 conv_iter = iter + 1
                 break
+            if r2 > 0.95:
+                break
         self.layer.load_state_dict(best_model_state)
         prune.l1_unstructured(
             self.layer.module, name="weight", amount=self.prune_amount_this_iteration
@@ -203,10 +225,12 @@ class CausalWeightsTrainerTorch(CausalWeightsTrainer):
     def get_non_zero_weights(self) -> torch.Tensor:
         return torch.flatten(self.layer.weight_mask)
 
+    @torch.no_grad()
+    def get_weight_importance(self) -> torch.Tensor:
+        return torch.flatten(self.layer.weight_orig)
 
-def get_causal_weights_trainer(
-    config: CausalWeightsTrainerConfig, *args
-) -> CausalWeightsTrainer:
+
+def get_causal_weights_trainer(config: CausalWeightsTrainerConfig, *args) -> CausalWeightsTrainer:
     if config.backend == "sklearn":
         return CausalWeightsTrainerSklearn(config)
     elif config.backend == "torch":
