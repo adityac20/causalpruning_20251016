@@ -207,6 +207,8 @@ class SGDPrunerConfig(PrunerConfig):
     trainer_config: CausalWeightsTrainerConfig
     num_batches_in_epoch: int = -1
     loss_fn: Callable = partial(F.cross_entropy, label_smoothing=0.1)
+###CHANGE##################################################################################
+    return_masks: bool = False
 
 
 class SGDPruner(Pruner):
@@ -303,6 +305,11 @@ class SGDPruner(Pruner):
         self.compute_masks()
         self.reset_weights()
         self.reset_params()
+###CHANGE##################################################################################
+        if self.config.return_masks:
+            # Helper to read the newly applied masks from the model
+            masks = self._get_current_masks_from_model()
+            return masks
 
     @torch.no_grad()
     def start_iteration(self):
@@ -494,3 +501,14 @@ class SGDPruner(Pruner):
             },
             dir_path,
         )
+#######################CHANGE###
+#Cannot just use get_masks function as it requires trainer object to be alive
+    @torch.no_grad()
+    def _get_current_masks_from_model(self) -> dict[str, torch.Tensor]:
+        masks = {}
+        for name, module in self.modules_dict.items():
+            if hasattr(module, 'weight_mask'):
+                masks[name] = module.weight_mask.detach().clone()
+            else:
+                masks[name] = torch.ones_like(module.weight)
+        return masks
