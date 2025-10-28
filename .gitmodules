@@ -1,2 +1,5 @@
-[submodule "https://github.com/JJGO/shrinkbench"]
+[submodule shrinkbench]
 	url = https://github.com/frogloki/shrinkbench
+	branch = shrinkbench_causal
+	path = shrinkbench
+
