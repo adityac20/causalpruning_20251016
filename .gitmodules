@@ -1,5 +1,4 @@
 [submodule shrinkbench]
 	url = https://github.com/frogloki/shrinkbench
 	branch = shrinkbench_causal
-	path = shrinkbench
 
