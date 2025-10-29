@@ -20,7 +20,7 @@ from causalpruner.average import AverageMeter
 from causalpruner.lrrt import (
     set_optimizer_lr,
 )
-from lr_schedulers import (
+from tests.lr_schedulers import (
     LrSchedulerConfig,
     create_lr_scheduler,
     wrap_lr_scheduler,

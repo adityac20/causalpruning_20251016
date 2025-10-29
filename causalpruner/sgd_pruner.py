@@ -254,6 +254,8 @@ class SGDPruner(Pruner):
         super().run_prune_iteration()
         self.start_iteration()
         config = self.config
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        config.model = config.model.to(device)
         num_batches_in_epoch = config.num_batches_in_epoch
         prune_pbar = tqdm(
             range(config.num_prune_epochs),
@@ -302,6 +304,7 @@ class SGDPruner(Pruner):
         # Shutdown prune_dataloader's worker until next iteration to save resources.
         del self.prune_dataloader._iterator
         self.prune_dataloader._iterator = None
+        print("Computing masks")
         self.compute_masks()
         self.reset_weights()
         self.reset_params()
