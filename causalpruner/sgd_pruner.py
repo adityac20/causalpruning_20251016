@@ -24,7 +24,6 @@ from causalpruner.base import Pruner, PrunerConfig
 from causalpruner.causal_weights_trainer import (
     CausalWeightsTrainerConfig,
     get_causal_weights_trainer,
-    CausalWeightsTrainerTorch, #CHANGE: Import for schedule calculation
 )
 
 _ZSTATS_PATTERN = "zstats.pth"
@@ -208,6 +207,7 @@ class SGDPrunerConfig(PrunerConfig):
     trainer_config: CausalWeightsTrainerConfig
     num_batches_in_epoch: int = -1
     loss_fn: Callable = partial(F.cross_entropy, label_smoothing=0.1)
+    ###CHANGE##################################################################################
     return_masks: bool = False
 
 
@@ -220,6 +220,7 @@ class SGDPruner(Pruner):
         self.loss_checkpoint_dir = os.path.join(self.checkpoint_dir, "loss")
         self.weights_checkpoint_dir = os.path.join(self.checkpoint_dir, "weights")
 
+        # Setup directories on the global_rank = 0
         if self.fabric.is_global_zero:
             if config.start_clean and os.path.exists(self.checkpoint_dir):
                 shutil.rmtree(self.checkpoint_dir)
@@ -251,11 +252,6 @@ class SGDPruner(Pruner):
 
     def run_prune_iteration(self) -> None:
         super().run_prune_iteration()
-
-        #CHANGE: Create a dynamic pruning schedule for this iteration
-        self._create_prune_schedule()
-        #ENDCHANGE
-
         self.start_iteration()
         config = self.config
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -280,11 +276,14 @@ class SGDPruner(Pruner):
             for inputs, labels in epoch_pbar:
                 self.prune_optimizer.zero_grad(set_to_none=True)
                 outputs = config.model(inputs)
+                # Compute loss
                 loss = config.loss_fn(outputs, labels)
                 self.provide_loss_before_step(loss)
+                # Take a gradient step
                 self.fabric.backward(loss)
                 loss_avg.update(loss)
                 self.prune_optimizer.step()
+                # Compute loss again
                 with torch.no_grad():
                     outputs = config.model(inputs)
                     loss = config.loss_fn(outputs, labels)
@@ -302,84 +301,62 @@ class SGDPruner(Pruner):
                 + f"Loss/Train: {loss:.4f}"
             )
         prune_pbar.close()
+        # Shutdown prune_dataloader's worker until next iteration to save resources.
+        # del self.prune_dataloader._iterator
+        # self.prune_dataloader._iterator = None
         print("Computing masks")
         self.compute_masks()
         self.reset_weights()
         self.reset_params()
-
-    #CHANGE: Add method to create a pruning schedule per iteration
-# In causalpruner/sgd_pruner.py
-
-    def _create_prune_schedule(self):
-        dummy_trainer = CausalWeightsTrainerTorch(
-            self.trainer_config,
-            num_params=1,
-            initial_mask=torch.ones(1),
-            prune_iteration=self.iteration + 1,
-            num_prune_iterations=self.config.num_prune_iterations,
-            verbose=False,
-        )
-        prune_amount_this_iteration_global = dummy_trainer.prune_amount_this_iteration
-
-        num_layers = len(self.params)
-        min_scale, max_scale = 0.5, 1.5
-        self.layer_prune_amounts = {}
-        tqdm.write("Layer pruning amounts for this iteration:")
-        for i, param in enumerate(self.params):
-            if num_layers > 1:
-                scale = min_scale + (max_scale - min_scale) * (i / (num_layers - 1))
-            else:
-                scale = 1.0
-            
-            amount = prune_amount_this_iteration_global * scale
-            
-            #CHANGE: Clamp the pruning amount to a valid range [0.0, 0.999]
-            # An amount >= 1.0 is invalid and will cause a crash.
-            amount = max(0.0, min(amount, 0.95))
-            #ENDCHANGE
-            
-            self.layer_prune_amounts[param] = amount
-            tqdm.write(f"- {param}: {amount:.4f}")
-
+        ###CHANGE##################################################################################
+        # if self.config.return_masks:
+        #     mask = self.get_masks()
+        #     return mask
 
     @torch.no_grad()
     def start_iteration(self):
         if self.fabric.is_global_zero:
             iteration_name = f"{self.iteration}"
-            self.loss_dir = os.path.join(self.loss_checkpoint_dir, iteration_name)
-            os.makedirs(self.loss_dir, exist_ok=True)
+            loss_dir = os.path.join(self.loss_checkpoint_dir, iteration_name)
+            os.makedirs(loss_dir, exist_ok=True)
+            weights_dir = os.path.join(self.weights_checkpoint_dir, iteration_name)
+            os.makedirs(weights_dir, exist_ok=True)
             self.weights_dir = os.path.join(
-                self.weights_checkpoint_dir, iteration_name
+                self.weights_checkpoint_dir, f"{self.iteration}"
             )
-            os.makedirs(self.weights_dir, exist_ok=True)
-            
-            #CHANGE: Create per-layer delta computers and directories
-            self.delta_weights_computers = {
-                param: DeltaComputer(transform=torch.square) for param in self.params
-            }
-            self.layer_weights_dirs = {}
-            for param in self.params:
-                layer_dir = os.path.join(self.weights_dir, param)
-                os.makedirs(layer_dir, exist_ok=True)
-                self.layer_weights_dirs[param] = layer_dir
-            #ENDCHANGE
-            
+            self.delta_weights_computer = DeltaComputer(transform=torch.square)
+            self.loss_dir = os.path.join(self.loss_checkpoint_dir, f"{self.iteration}")
             self.delta_loss_computer = DeltaComputer()
             self.checkpoint_futures = []
             self.init_model_state = copy.deepcopy(self.config.model.state_dict())
         self.fabric.barrier()
 
+    @torch.no_grad()
+    def get_flattened_weight(self) -> torch.Tensor:
+        weights = []
+        for param in self.params:
+            weight = self.modules_dict[param].weight.detach().clone()
+            weights.append(weight)
+        return torch.cat(tuple(map(torch.flatten, weights)))
+
+    @torch.no_grad()
+    def get_flattened_mask(self) -> torch.Tensor:
+        def get_mask(param):
+            param_module = self.modules_dict[param]
+            if not hasattr(param_module, "weight_mask"):
+                mask = torch.ones_like(param_module.weight)
+            else:
+                mask = param_module.weight_mask.detach()
+            return torch.flatten(mask)
+
+        return torch.cat(tuple(map(get_mask, self.params)))
 
     @torch.no_grad()
     def provide_loss_before_step(self, loss: torch.tensor) -> None:
         if self.fabric.is_global_zero:
             torch.cuda.synchronize()
             self.delta_loss_computer.add_first(loss)
-            #CHANGE: Capture weights per layer
-            for param in self.params:
-                weight = self.modules_dict[param].weight.detach().clone()
-                self.delta_weights_computers[param].add_first(weight)
-            #ENDCHANGE
+            self.delta_weights_computer.add_first(self.get_flattened_weight())
             torch.cuda.synchronize()
         self.fabric.barrier()
 
@@ -388,22 +365,17 @@ class SGDPruner(Pruner):
         if self.fabric.is_global_zero:
             torch.cuda.synchronize()
             self.delta_loss_computer.add_second(loss)
+            self.delta_weights_computer.add_second(self.get_flattened_weight())
+
             delta_loss = self.delta_loss_computer.get_delta().to("cpu")
             if delta_loss is not None:
                 self.write_tensor(delta_loss, self._get_checkpoint_path(self.loss_dir))
-            
-            #CHANGE: Capture and write delta_weights per layer
-            for param in self.params:
-                weight = self.modules_dict[param].weight.detach().clone()
-                self.delta_weights_computers[param].add_second(weight)
-                delta_weights = self.delta_weights_computers[param].get_delta()
-                if delta_weights is not None:
-                    layer_dir = self.layer_weights_dirs[param]
-                    self.write_tensor(
-                        delta_weights.flatten().to("cpu"),
-                        self._get_checkpoint_path(layer_dir),
-                    )
-            #ENDCHANGE
+
+            delta_weights = self.delta_weights_computer.get_delta().to("cpu")
+            if delta_weights is not None:
+                self.write_tensor(
+                    delta_weights, self._get_checkpoint_path(self.weights_dir)
+                )
             torch.cuda.synchronize()
         self.fabric.barrier()
         self.counter += 1
@@ -413,24 +385,25 @@ class SGDPruner(Pruner):
         if not self.threaded_checkpoint_writer:
             torch.save(tensor, path)
             return
+        # Use threading to write checkpoint
         while psutil.virtual_memory().percent >= 99.5:
-            time.sleep(0.1)
+            time.sleep(0.1)  # 100ms
         future = self.checkpointer.submit(torch.save, tensor, path)
         self.checkpoint_futures.append(future)
 
     def compute_masks(self):
-        #CHANGE: Get masks from the new layer-wise training function and apply them
-        new_masks = self.train_pruning_weights()
+        self.train_pruning_weights()
         self.config.model.load_state_dict(self.init_model_state)
         with torch.no_grad():
+            masks = self.get_masks()
             for module_name, module in self.modules_dict.items():
-                prune.custom_from_mask(module, "weight", new_masks[module_name])
-        #ENDCHANGE
+                prune.custom_from_mask(module, "weight", masks[module_name])
+        # del self.trainer
+        # self.trainer = None
         torch.cuda.empty_cache()
         gc.collect()
 
-    #CHANGE: Re-implement this function to loop through layers and train a separate trainer for each
-    def train_pruning_weights(self) -> dict[str, torch.Tensor]:
+    def train_pruning_weights(self) -> None:
         if self.threaded_checkpoint_writer and self.fabric.is_global_zero:
             concurrent.futures.wait(self.checkpoint_futures)
             del self.checkpoint_futures
@@ -441,89 +414,70 @@ class SGDPruner(Pruner):
         torch.cuda.empty_cache()
         gc.collect()
 
-        new_masks = {}
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        ordered_dims = [self.params_to_dims[p] for p in self.params]
 
-        for param in tqdm(self.params, desc="Analyzing Layers"):
-            param_module = self.modules_dict[param]
-            if not hasattr(param_module, "weight_mask"):
-                initial_mask = torch.ones_like(param_module.weight)
-            else:
-                initial_mask = param_module.weight_mask.detach()
+        self.trainer = get_causal_weights_trainer(
+            self.trainer_config,
+            self.num_params,
+            self.get_flattened_mask(),
+            self.iteration + 1,
+            self.config.num_prune_iterations,
+            self.verbose,
+            ordered_dims, # CHANGE: Pass dimensions here
+        )
 
-            layer_weights_dir = self.layer_weights_dirs[param]
-            dataset = ParamDataset(
-                layer_weights_dir,
-                self.loss_dir,
-                self.prune_optimizer_lr,
+        dataset = ParamDataset(
+            self.weights_dir,
+            self.loss_dir,
+            self.prune_optimizer_lr,
+        )
+
+        batch_size = self.trainer_config.batch_size
+        if batch_size < 0 or not self.trainer.supports_batch_training():
+            batch_size = len(dataset)
+        pin_memory = self.trainer_config.pin_memory
+        num_workers = self.trainer_config.num_dataloader_workers
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            pin_memory=pin_memory,
+            shuffle=True,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
+        )
+
+        num_iters = self.trainer.fit(dataloader)
+        if num_iters == self.trainer_config.max_iter:
+            tqdm.write(
+                "Pruning failed to converge in "
+                + f"{num_iters} steps. Consider increasing "
+                + "--causal_weights_num_epochs"
             )
-
-            # Skip if no data was collected for this layer
-            if len(dataset) == 0:
-                tqdm.write(f"Skipping layer {param}, no data collected.")
-                new_masks[param] = initial_mask.clone()
-                continue
-            
-            # Use a local copy of the config to modify prune_amount
-            local_trainer_config = copy.deepcopy(self.trainer_config)
-            local_trainer_config.prune_amount = self.layer_prune_amounts[param]
-
-            trainer = get_causal_weights_trainer(
-                local_trainer_config,
-                self.params_to_dims[param],
-                initial_mask.flatten(),
-                self.iteration + 1,
-                self.config.num_prune_iterations,
-                self.verbose,
-            )
-
-            batch_size = local_trainer_config.batch_size
-            if batch_size < 0 or not trainer.supports_batch_training():
-                batch_size = len(dataset)
-            
-            dataloader = DataLoader(
-                dataset,
-                batch_size=batch_size,
-                pin_memory=local_trainer_config.pin_memory,
-                shuffle=True,
-                num_workers=local_trainer_config.num_dataloader_workers,
-                persistent_workers=local_trainer_config.num_dataloader_workers > 0,
-            )
-
-            trainer.fit(dataloader)
-            
-            mask_flat = trainer.get_non_zero_weights()
-            new_masks[param] = mask_flat.to(device).reshape_as(param_module.weight)
-
-            # Clean up layer-specific checkpoints
-            if self.fabric.is_global_zero:
-                self._delete_checkpoint_dir(layer_weights_dir)
-
+        else:
+            tqdm.write(f"Pruning converged in {num_iters} steps")
         if self.fabric.is_global_zero:
+            self._delete_checkpoint_dir(self.weights_dir)
             self._delete_checkpoint_dir(self.loss_dir)
         self.fabric.barrier()
-        
-        return new_masks
-    #ENDCHANGE
 
     def _delete_checkpoint_dir(self, dirpath: str):
         if not self.config.delete_checkpoint_dir_after_training:
             return
-        if os.path.exists(dirpath): #CHANGE: Add check for existence
-            shutil.rmtree(dirpath)
-
+        shutil.rmtree(dirpath)
 
     @torch.no_grad()
     def get_masks(self) -> dict[str, torch.Tensor]:
-        masks = {}
-        for param_name, module in self.modules_dict.items():
-            # The prune utility attaches the mask as an attribute named 'weight_mask'
-            if hasattr(module, "weight_mask"):
-                # Make a detached copy to avoid holding onto computation graph history
-                masks[param_name] = module.weight_mask.detach().clone()
-            else:
-                # If the layer has never been pruned, its mask is all ones.
-                masks[param_name] = torch.ones_like(module.weight)
+        mask = self.trainer.get_non_zero_weights()
+        masks = dict()
+        start_index, end_index = 0, 0
+        for param in self.params:
+            end_index += self.params_to_dims[param]
+            weight = self.modules_dict[param].weight
+            masks[param] = (
+                mask[start_index:end_index].to(weight.device).reshape_as(weight)
+            )
+            start_index = end_index
         return masks
 
     def _get_checkpoint_path(self, checkpoint_dir: str) -> str:
@@ -533,11 +487,9 @@ class SGDPruner(Pruner):
         self._write_zscaling_params_from_computer(
             self.delta_loss_computer, self.loss_dir
         )
-        #CHANGE: Write z-stats for each layer
-        for param, computer in self.delta_weights_computers.items():
-            layer_dir = self.layer_weights_dirs[param]
-            self._write_zscaling_params_from_computer(computer, layer_dir)
-        #ENDCHANGE
+        self._write_zscaling_params_from_computer(
+            self.delta_weights_computer, self.weights_dir
+        )
 
     def _write_zscaling_params_from_computer(
         self, computer: DeltaComputer, dir_path: str
@@ -554,3 +506,15 @@ class SGDPruner(Pruner):
             },
             dir_path,
         )
+
+    #######################CHANGE###
+    # Cannot just use get_masks function as it requires trainer object to be alive
+    # @torch.no_grad()
+    # def _get_current_masks_from_model(self) -> dict[str, torch.Tensor]:
+    #     masks = {}
+    #     for name, module in self.modules_dict.items():
+    #         if hasattr(module, "weight_mask"):
+    #             masks[name] = module.weight_mask.detach().clone()
+    #         else:
+    #             masks[name] = torch.ones_like(module.weight)
+    #     return masks
